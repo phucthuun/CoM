@@ -18,7 +18,8 @@ output:
 
 packages <- c(
   "rstudioapi", "stringr", "ggplot2", "cowplot", "tidyr", "dplyr", "data.table", "tibble", "rstatix",
-  "readxl", "writexl", "gridExtra", "broom", "lme4", "afex"
+  "readxl", "writexl", "gridExtra", "broom", "lme4", "afex",
+  "dtw", "distantia"
 )
 invisible(lapply(packages, function(pkg) {
   if (!require(pkg, character.only = TRUE)) {
@@ -37,27 +38,45 @@ script_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
 df_list <- list()
 all_files <- list.files(path = script_path, pattern = "*.csv")
 specific_files <- all_files %>% sort()
-
 for (file in specific_files) {
-  temp_df <- read.csv(file.path(script_path, file), header = TRUE)
+  temp_df <- read.csv(file.path(script_path, file), header = TRUE)[, c(1:52)]
 
-  names(temp_df) <- paste(temp_df[1, ], temp_df[2, ], sep = "_")
-  temp_df <- temp_df[-c(1, 2), ]
+  names(temp_df) <- paste(temp_df[2, ], temp_df[3, ], sep = "_")
+  temp_df <- temp_df[-c(1:3), ]
   df_list[[length(df_list) + 1]] <- temp_df %>%
-    mutate(filename = file %>% str_extract(".*(?=.csv)"),
-           camera = paste0("camera-",filename %>% str_extract("\\d*(?=_)")),
-           technique = filename %>% str_extract("(?<=_).*"),
-          .before = bodyparts_coords)
+    mutate(
+      filename = file %>% str_extract(".*(?=.csv)"),
+      camera = paste0("camera-", filename %>% str_extract("\\d*(?=_)")),
+      technique = filename %>% str_extract("(?<=_).*"),
+      bodyparts_coords = as.numeric(bodyparts_coords),
+      .before = bodyparts_coords
+    )
 }
 
 shortDF <- do.call(rbind, df_list)
 
+shortDF <- shortDF %>%
+  group_by(filename, camera, technique) %>%
+  arrange(bodyparts_coords) %>%
+  mutate(
+    across(ends_with("_x"), ~ as.numeric(.) - first(as.numeric(.))),
+    across(ends_with("_y"), ~ as.numeric(.)),
+    across(ends_with("_likelihood"), ~ as.numeric(.))
+  ) %>%
+  ungroup()
+
+names(shortDF)
+
 combined_df <- shortDF %>%
   pivot_longer(
-    cols = -c(bodyparts_coords, filename, camera, technique),
-    names_to = c("body", "coords"),
-    names_sep = "_",
+    cols = matches(".*_(x|y|likelihood)$"),
+    names_to = "full_name",
     values_to = "value"
+  ) %>%
+  extract(
+    col = full_name,
+    into = c("side", "bodyp", "coords"),
+    regex = "^(left|right)?_?(\\w+?)_(x|y|likelihood)$"
   ) %>%
   mutate(
     technique = as.factor(technique),
@@ -67,11 +86,18 @@ combined_df <- shortDF %>%
   pivot_wider(
     names_from = coords,
     values_from = value
-  )
+  ) %>%
+  mutate(body = paste0(bodyp, side)) # %>%
+# group_by(filename, camera, technique, body) %>%
+# arrange(bodyparts_coords) %>%
+# mutate(x=x-first(x))
 
+combined_df$body <- factor(combined_df$body, levels = c("eyeleft", "eyeright", "earleft", "earright", "nose", "shoulderleft", "shoulderright", "elbowleft", "elbowright", "wristleft", "wristright", "hipleft", "hipright", "kneeleft", "kneeright", "ankleleft", "ankleright"))
 
 # Prepare skeleton
 skeleton <- list(
+  c("earleft", "eyeleft"),
+  c("earright", "eyeright"),
   c("eyeleft", "eyeright"),
   c("eyeleft", "nose"),
   c("eyeright", "nose"),
@@ -87,6 +113,7 @@ skeleton <- list(
   # c("wristleft", "knuckleleft"),
   # c("knuckleleft", "fingerleft"),
   c("shoulderright", "hipright"),
+  c("shoulderright", "shoulderleft"),
   c("hipright", "kneeright"),
   c("kneeright", "ankleright"),
   c("ankleright", "heelright"),
@@ -102,8 +129,18 @@ skeleton <- list(
 )
 ```
 
+# Data quality
 
 
+```{r fig.width=12, fig.height=5, echo=FALSE, warning=FALSE, message=FALSE}
+ggplot(combined_df) +
+  geom_boxplot(aes(y = likelihood, x = body, fill = body), show.legend = T) +
+  facet_wrap(~technique, nrow=2)
+```
+
+# CoM
+
+## Calculation
 To calculate the measure of gravity (often interpreted as the center of mass or gravitational torque) from body part coordinates, you’ll need to clarify what exactly you're trying to compute. Here arethe possibility to estimate Center of Mass (COM) using 2D coordinates of body parts (e.g., joints)
 
 
@@ -150,55 +187,214 @@ Each calf: 4%
 
 ```{r warning=FALSE, message=FALSE, echo=FALSE}
 CoMDF <- shortDF %>%
-  mutate(across(-c(filename, camera, technique), as.numeric)) %>%
+  mutate(across(-c(filename, camera, technique, bodyparts_coords), as.numeric)) %>%
   mutate(
+    # Head
     head_x = nose_x, head_y = nose_y,
-    head_w = .08,
-    torso_x = mean(c(shoulderleft_x, shoulderright_x, hipright_x, hipleft_x)),
-    torso_y = mean(c(shoulderleft_y, shoulderright_y, hipright_y, hipleft_y)),
-    torso_w = .4970,
-    upperarmleft_x = mean(c(shoulderleft_x, elbowleft_x)), upperarmright_x = mean(c(shoulderright_x, elbowright_x)),
-    upperarmleft_y = mean(c(shoulderleft_y, elbowleft_y)), upperarmright_y = mean(c(shoulderright_y, elbowright_y)),
+    head_w = 0.08,
+
+    # Torso
+    torso_x = rowMeans(across(c(left_shoulder_x, right_shoulder_x, left_hip_x, right_hip_x))),
+    torso_y = rowMeans(across(c(left_shoulder_y, right_shoulder_y, left_hip_y, right_hip_y))),
+    torso_w = 0.4970,
+
+    # Upper arms
+    upperarmleft_x = rowMeans(across(c(left_shoulder_x, left_elbow_x))),
+    upperarmright_x = rowMeans(across(c(right_shoulder_x, right_elbow_x))),
+    upperarmleft_y = rowMeans(across(c(left_shoulder_y, left_elbow_y))),
+    upperarmright_y = rowMeans(across(c(right_shoulder_y, right_elbow_y))),
     upperarm_w = 0.0280 * 2,
-    forearmleft_x = mean(c(wristleft_x, elbowleft_x)), forearmright_x = mean(c(wristright_x, elbowright_x)),
-    forearmleft_y = mean(c(wristleft_y, elbowleft_y)), forearmright_y = mean(c(wristright_y, elbowright_y)),
+
+    # Forearms
+    forearmleft_x = rowMeans(across(c(left_wrist_x, left_elbow_x))),
+    forearmright_x = rowMeans(across(c(right_wrist_x, right_elbow_x))),
+    forearmleft_y = rowMeans(across(c(left_wrist_y, left_elbow_y))),
+    forearmright_y = rowMeans(across(c(right_wrist_y, right_elbow_y))),
     forearm_w = 0.0160 * 2,
-    thighleft_x = mean(c(hipleft_x, kneeleft_x)), thighright_x = mean(c(hipright_x, kneeright_x)),
-    thighleft_y = mean(c(hipleft_y, kneeleft_y)), thighright_y = mean(c(hipright_y, kneeright_y)),
+
+    # Thighs
+    thighleft_x = rowMeans(across(c(left_hip_x, left_knee_x))),
+    thighright_x = rowMeans(across(c(right_hip_x, right_knee_x))),
+    thighleft_y = rowMeans(across(c(left_hip_y, left_knee_y))),
+    thighright_y = rowMeans(across(c(right_hip_y, right_knee_y))),
     thigh_w = 0.1000 * 2,
-    calfleft_x = mean(c(ankleleft_x, kneeleft_x)), calfright_x = mean(c(ankleright_x, kneeright_x)),
-    calfleft_y = mean(c(ankleleft_y, kneeleft_y)), calfright_y = mean(c(ankleright_y, kneeright_y)),
+
+    # Calves
+    calfleft_x = rowMeans(across(c(left_ankle_x, left_knee_x))),
+    calfright_x = rowMeans(across(c(right_ankle_x, right_knee_x))),
+    calfleft_y = rowMeans(across(c(left_ankle_y, left_knee_y))),
+    calfright_y = rowMeans(across(c(right_ankle_y, right_knee_y))),
     calf_w = 0.0465 * 2
   ) %>%
-  select(filename, camera, technique, bodyparts_coords, starts_with(c("head", "torso", "upperarm", "forearm", "thigh", "calf"))) %>%
   rowwise() %>%
   mutate(
-    com_x = sum(c_across(ends_with("_x")) * c_across(ends_with("_w"))) / sum(c_across(ends_with("_w"))),
-    com_y = sum(c_across(ends_with("_y")) * c_across(ends_with("_w"))) / sum(c_across(ends_with("_w")))
+    com_x = sum(
+      c(
+        head_x, torso_x, upperarmleft_x, upperarmright_x, forearmleft_x, forearmright_x,
+        thighleft_x, thighright_x, calfleft_x, calfright_x
+      ) *
+        c(
+          head_w, torso_w, upperarm_w, upperarm_w, forearm_w, forearm_w,
+          thigh_w, thigh_w, calf_w, calf_w
+        )
+    ) / sum(c(
+      head_w, torso_w, upperarm_w, upperarm_w, forearm_w, forearm_w,
+      thigh_w, thigh_w, calf_w, calf_w
+    )),
+    com_y = sum(
+      c(
+        head_y, torso_y, upperarmleft_y, upperarmright_y, forearmleft_y, forearmright_y,
+        thighleft_y, thighright_y, calfleft_y, calfright_y
+      ) *
+        c(
+          head_w, torso_w, upperarm_w, upperarm_w, forearm_w, forearm_w,
+          thigh_w, thigh_w, calf_w, calf_w
+        )
+    ) / sum(c(
+      head_w, torso_w, upperarm_w, upperarm_w, forearm_w, forearm_w,
+      thigh_w, thigh_w, calf_w, calf_w
+    ))
   ) %>%
-  ungroup()
+  ungroup() %>%
+  select(filename, camera, technique, bodyparts_coords, starts_with("com_")) %>%
+  arrange(technique, bodyparts_coords)
 ```
 
+A visualization:
 
 ```{r fig.width=12, fig.height=5, echo=FALSE, warning=FALSE, message=FALSE}
 ggplot(CoMDF) +
-  geom_point(aes(x = com_x, y = com_y, color = bodyparts_coords), show.legend = F) +
-  facet_wrap(camera~technique, ncol = length(unique(combined_df$filename))) +
-  scale_x_reverse() +
-  scale_y_reverse()
-
-
-
-ggplot(combined_df %>% filter(body %in% c(
-  "toeleft", "toeright",
-  "wristright", # "wristleft",
-  "eyeleft" # , "eyeright"
-))) +
-  geom_point(aes(x = x, y = y, color = bodyparts_coords), show.legend = F) +
-  facet_wrap(camera+body~technique, ncol = length(unique(combined_df$filename))) +
-  scale_x_reverse() +
-  scale_y_reverse()
+  geom_point(aes(x = com_x, y = com_y, color = bodyparts_coords), show.legend = T) +
+  facet_wrap(camera ~ technique, ncol = length(unique(combined_df$filename))) +
+  scale_x_reverse("X position in pixels") +
+  scale_y_reverse("Y position in pixels")
 ```
+
+## Dynamic Time Warping
+
+https://rpubs.com/esobolewska/dtw-time-series
+
+https://www.blasbenito.com/post/distantia-showcase-covid/
+
+### x and y axis
+
+```{r fig.width=12, fig.height=5, echo=FALSE, warning=FALSE, message=FALSE}
+tsl <- tsl_initialize(
+  x = CoMDF %>% select(technique, bodyparts_coords, com_y),
+  name_column = "technique",
+  time_column = "bodyparts_coords"
+)
+
+tsl_plot(
+  tsl = tsl,
+  columns = length(tsl),
+  guide = FALSE,
+  text_cex = 1.4
+)
+
+# DTW
+df_psi <- tsl %>%
+  distantia_dtw() %>%
+  mutate(psi = round(psi, 3))
+
+df_psi_stats <- distantia_stats(
+  df = df_psi
+)
+
+distantia::distantia_boxplot(
+  df = df_psi,
+  text_cex = 1.4
+)
+
+# Clustering
+
+psi_cluster <- distantia::distantia_cluster_hclust(
+  df = df_psi
+)
+
+k <- psi_cluster$clusters
+
+factoextra::fviz_dend(
+  x = psi_cluster$cluster_object,
+  k = k,
+  k_colors = distantia::color_discrete(n = k),
+  cex = 1,
+  label_cols = "gray20",
+  rect = TRUE,
+  horiz = TRUE,
+  main = "",
+  ylab = "Dissimilarity"
+)
+```
+
+
+
+# Whole-body trajectory
+```{r fig.width=12, fig.height=5, echo=FALSE, warning=FALSE, message=FALSE}
+ggplot(combined_df %>% filter(technique %in% c("deashibaraiL21", "iponseonageL23", "ogoshiL2_V11"))) +
+  geom_point(aes(x = x, y = y, color = body), show.legend = T) +
+  facet_wrap(~technique, ncol = length(unique(combined_df$filename))) +
+  scale_x_reverse("X position in pixels") +
+  scale_y_reverse("Y position in pixels")
+```
+
+DTW
+
+```{r fig.width=12, fig.height=5, echo=FALSE, warning=FALSE, message=FALSE}
+tsl <- tsl_initialize(
+  x = shortDF %>%
+    select(
+      technique, bodyparts_coords, # ends_with('_x'),
+      ends_with("y")
+    ) %>%
+    select(-matches("^(eye|nose|knuckle|finger)")) %>%
+    mutate(bodyparts_coords = as.numeric(bodyparts_coords)),
+  name_column = "technique",
+  time_column = "bodyparts_coords"
+)
+
+tsl_plot(
+  tsl = tsl,
+  columns = 5,
+  guide = FALSE,
+  text_cex = 1.2
+)
+
+# DTW
+df_psi <- tsl %>%
+  distantia_dtw() %>%
+  mutate(psi = round(psi, 3))
+
+df_psi_stats <- distantia_stats(
+  df = df_psi
+)
+
+distantia::distantia_boxplot(
+  df = df_psi,
+  text_cex = 1.4
+)
+
+# Clustering
+
+psi_cluster <- distantia::distantia_cluster_hclust(
+  df = df_psi
+)
+
+k <- psi_cluster$clusters
+
+factoextra::fviz_dend(
+  x = psi_cluster$cluster_object,
+  k = k,
+  k_colors = distantia::color_discrete(n = k),
+  cex = 1,
+  label_cols = "gray20",
+  rect = TRUE,
+  horiz = TRUE,
+  main = "",
+  ylab = "Dissimilarity"
+)
+```
+
 
 
 
@@ -210,48 +406,53 @@ x_min <- min(combined_df$x, na.rm = TRUE)
 x_max <- max(combined_df$x, na.rm = TRUE)
 y_min <- min(combined_df$y, na.rm = TRUE)
 y_max <- max(combined_df$y, na.rm = TRUE)
-# i=87
-for (i in seq(0,max(combined_df$bodyparts_coords,na.rm = T))) {
-  filtered_df <- combined_df %>% 
-    filter(bodyparts_coords == i & #likelihood>=.05 &
-             !(body %in% c("neck","knuckleleft","knuckleright","fingerleft","fingerright")) 
-             )%>%
-    complete(technique, bodyparts_coords = i)
+
+silence <- 0
+
+if (silence == 0) {
+  for (i in seq(0, max(combined_df$bodyparts_coords, na.rm = T))) {
+    filtered_df <- combined_df %>%
+      filter(bodyparts_coords == i & # likelihood>=.05 &
+        !(body %in% c("neck", "knuckleleft", "knuckleright", "fingerleft", "fingerright"))) %>%
+      complete(technique, bodyparts_coords = i)
 
 
 
-  # Create connection data
-  connections <- do.call(rbind, lapply(skeleton, function(pair) {
-    part1 <- filtered_df %>% filter(body == pair[1])
-    part2 <- filtered_df %>% filter(body == pair[2])
-    inner_join(part1, part2, by = "technique", suffix = c("_1", "_2")) %>%
-      mutate(pair = paste(pair, collapse = "-"))
-  }))
+    # Create connection data
+    connections <- do.call(rbind, lapply(skeleton, function(pair) {
+      part1 <- filtered_df %>% filter(body == pair[1])
+      part2 <- filtered_df %>% filter(body == pair[2])
+      inner_join(part1, part2, by = "technique", suffix = c("_1", "_2")) %>%
+        mutate(pair = paste(pair, collapse = "-"))
+    }))
 
 
-  # Plot with facet_wrap
-  ggplot() +
-    geom_point(data = filtered_df, aes(x = x, y = y), color = "white") +
-    geom_segment(data = connections, aes(x = x_1, y = y_1, xend = x_2, yend = y_2), color = "white") +
-    scale_x_continuous(limits = c(x_min, x_max), breaks = seq.int(x_min, x_max, length.out = 3) %>% round()) +
-    scale_y_reverse(limits = c(y_max, y_min), breaks = seq.int(y_min, y_max, length.out = 5) %>% round()) +
-    facet_wrap(~technique, ncol = length(unique(combined_df$filename)), drop = T, nrow=1) +
-    theme_void() +
-    theme(
-      plot.background = element_rect(fill = "black", color = NA),
-      panel.background = element_rect(fill = "black", color = NA),
-      panel.border = element_rect(color = "white", fill = NA, linewidth = 0.5),
-      strip.background = element_rect(fill = "black", color = "white"), # Box around facet label
-      strip.text = element_text(color = "white", size = 16), # Facet label text in white
-      axis.text = element_text(color = "white"),
-      axis.title = element_text(color = "white"),
-      text = element_text(color = "white")
+    # Plot with facet_wrap
+    ggplot() +
+      geom_point(data = filtered_df, aes(x = x, y = y), color = "white") +
+      geom_segment(data = connections, aes(x = x_1, y = y_1, xend = x_2, yend = y_2), color = "white") +
+      scale_x_continuous(limits = c(x_min, x_max), breaks = seq.int(x_min, x_max, length.out = 3) %>% round()) +
+      scale_y_reverse(limits = c(y_max, y_min), breaks = seq.int(y_min, y_max, length.out = 5) %>% round()) +
+      facet_wrap(~technique, ncol = length(unique(combined_df$filename)), drop = T, nrow = 1) +
+      theme_void() +
+      theme(
+        plot.background = element_rect(fill = "black", color = NA),
+        panel.background = element_rect(fill = "black", color = NA),
+        panel.border = element_rect(color = "white", fill = NA, linewidth = 0.5),
+        strip.background = element_rect(fill = "black", color = "white"), # Box around facet label
+        strip.text = element_text(color = "white", size = 16), # Facet label text in white
+        axis.text = element_text(color = "white"),
+        axis.title = element_text(color = "white"),
+        text = element_text(color = "white")
+      )
+
+
+
+    ggsave(paste0(sprintf("%03d", i), ".png"),
+      path = file.path(script_path, "pngs"),
+      width = 2972, height = 1929, units = "px"
     )
-
-
-
-  ggsave(paste0(sprintf("%03d", i), ".png"), path = file.path(script_path, "pngs"),
-         width=2972, height=1929, units="px")
+  }
 }
 ```
 
